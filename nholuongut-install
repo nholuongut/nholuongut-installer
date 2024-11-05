@@ -1,0 +1,384 @@
+#!/bin/bash
+#
+# This script installs nholuongut Script Modules. The main motivation in writing it is to make installing
+# nholuongut Script Modules feel as easy as installing a package using apt-get, brew, or yum.
+#
+# Note that if the user specifies neither --tag nor --branch, the latest tag is downloaded.
+#
+
+set -e
+
+readonly MODULES_DIR="modules"
+readonly MODULE_INSTALL_FILE_NAME="install.sh"
+
+readonly DEFAULT_MODULES_DOWNLOAD_DIR="/tmp/nholuongut-script-modules"
+readonly DEFAULT_BIN_DIR="/usr/local/bin"
+
+function print_usage {
+  echo
+  echo "Usage: nholuongut-install [OPTIONS]"
+  echo
+  echo "Download a nholuongut Script Module and install it."
+  echo
+  echo "Required Arguments:"
+  echo
+  echo -e "  --repo\t\tThe repo to install from."
+  echo -e "  --tag\t\t\tThe version of --repo to install. Follows the syntax described at https://github.com/nholuongut-io/fetch#tag-constraint-expressions."
+  echo
+  echo "Specify exactly one of:"
+  echo
+  echo -e "  --module-name\t\t\tThe name of a module to install. Can be any folder within the $MODULES_DIR directory of --repo."
+  echo -e "  --binary-name\t\t\tThe name of a binary to install. Can be any file uploaded as a release asset in --repo."
+  echo -e "  --binary-sha256-checksum\tThe SHA256 checksum of the binary specified by --binary-name. Should be exactly 64 characters."
+  echo -e "  --binary-sha512-checksum\tThe SHA512 checksum of the binary specified by --binary-name. Should be exactly 128 characters."
+  echo
+  echo "Optional Arguments:"
+  echo
+  echo -e "  --module-param\tA key-value pair of the format key=value you wish to pass to the module as a parameter. May be used multiple times."
+  echo -e "  --download-dir\tThe directory to which the module will be downloaded and from which it will be installed. Default: $DEFAULT_MODULES_DOWNLOAD_DIR"
+  echo -e "  --binary-install-dir\tThe directory to which the binary will be installed. Only applies to binaries (not modules). Default: $DEFAULT_BIN_DIR"
+  echo -e "  --no-sudo\t\tWhen true, don't use sudo to install the binary into the install directory. Only applies to binaries (not modules). Default: false"
+  echo -e "  --branch\t\tDownload the latest commit from this branch in --repo. Does not work with installing binaries (--binary-name). This is an alternative to --tag, used only for testing."
+  echo -e "  --ref\t\tDownload the specific Git ref (branch, tag, or commit SHA) in --repo. Does not work with installing binaries (--binary-name). This is an alternative to --tag and --branch, used only for testing."
+  echo -e "  --help\t\tShow this help text and exit."
+
+  echo
+  echo "Example:"
+  echo
+  echo "  nholuongut-install \\"
+  echo "    --module-name 'fail2ban' \\"
+  echo "    --repo 'https://github.com/nholuongut-io/terraform-aws-security' \\"
+  echo "    --tag 'v0.44.9'"
+  echo
+}
+
+function log {
+  local -r level="$1"
+  shift
+  local -ra message=("$@")
+  local -r timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local -r scriptname="$(basename "$0")"
+
+  >&2 echo -e "${timestamp} [${level}] [$scriptname] ${message[*]}"
+}
+
+function log_info {
+  local -ra message=("$@")
+  log "INFO" "${message[@]}"
+}
+
+function log_warn {
+  local -ra message=("$@")
+  log "WARN" "${message[@]}"
+}
+
+function log_error {
+  local -ra message=("$@")
+  log "ERROR" "${message[@]}"
+}
+
+function maybe_sudo {
+  local -r no_sudo="$1"
+  shift
+
+  if [[ "$no_sudo" == "true" ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Assert that a given binary is installed on this box
+function assert_is_installed {
+  local -r name="$1"
+
+  if [[ ! "$(command -v "${name}")" ]]; then
+    log_error "The binary '$name' is required by this script but is not installed or in the system's PATH."
+    exit 1
+  fi
+}
+
+function assert_not_empty {
+  local -r arg_name="$1"
+  local -r arg_value="$2"
+
+  if [[ -z "$arg_value" ]]; then
+    log_error "The value for '$arg_name' cannot be empty"
+    print_usage
+    exit 1
+  fi
+}
+
+function assert_env_var_not_empty {
+  local -r var_name="$1"
+  local -r var_value="${!var_name}"
+
+  if [[ -z "$var_value" ]]; then
+    log_error "Required environment variable $var_name not set."
+    exit 1
+  fi
+}
+
+# Download the files of the given Script Module using fetch (https://github.com/nholuongut-io/fetch)
+function fetch_script_module {
+  local -r module_name="$1"
+  local -r tag="$2"
+  local -r branch="$3"
+  local -r ref="$4"
+  local -r download_dir="$5"
+  local -r repo="$6"
+
+  # We want to make sure that all folders down to $download_path/$module_name exists, but that $download_path/$module_name itself is empty.
+  mkdir -p "$download_dir/$module_name/"
+  rm -Rf "${download_dir:?}/${module_name:?}/"
+
+  # Note that fetch can safely handle blank arguments for --tag or --branch
+  # If both --tag and --branch are specified, --branch will be used
+  log_info "Downloading module $module_name from $repo"
+  fetch --ref="$ref" --repo="$repo" --tag="$tag" --branch="$branch" --source-path="/modules/$module_name" "$download_dir/$module_name"
+}
+
+# Download a binary asset from a GitHub release using fetch (https://github.com/nholuongut-io/fetch)
+function fetch_binary {
+  local -r binary_name="$1"
+  local -r tag="$2"
+  local -r download_dir="$3"
+  local -r repo="$4"
+  local -r sha256_checksum="$5"
+  local -r sha512_checksum="$6"
+  local -r binary_install_dir="$7"
+  local -r no_sudo="$8"
+
+  local binary_name_full=""
+  binary_name_full=$(determine_binary_name "$binary_name")
+
+  local -r full_download_path="$download_dir/$binary_name_full"
+  local -r full_dest_path="$binary_install_dir/$binary_name"
+
+  # We want to make sure that all folders down to $download_path exist, but that $download_path/$binary_name_full does not
+  mkdir -p "$download_dir"
+  rm -f "$download_dir/$binary_name_full"
+
+  if [[ -n "$sha256_checksum" ]]; then
+    fetch --repo="$repo" --tag="$tag" --release-asset="$binary_name_full" "$download_dir" --release-asset-checksum-algo "sha256" --release-asset-checksum "$sha256_checksum"
+   elif [[ -n "$sha512_checksum" ]]; then
+    fetch --repo="$repo" --tag="$tag" --release-asset="$binary_name_full" "$download_dir" --release-asset-checksum-algo "sha512" --release-asset-checksum "$sha512_checksum"
+  else
+    fetch --repo="$repo" --tag="$tag" --release-asset="$binary_name_full" "$download_dir"
+  fi
+
+  log_info "Moving $full_download_path to $full_dest_path and setting execute permissions"
+  maybe_sudo "$no_sudo" mv "$full_download_path" "$full_dest_path"
+  maybe_sudo "$no_sudo" chmod u+x "$full_dest_path"
+}
+
+# Validate that at least one file was downloaded from the module; otherwise throw an error.
+function validate_module {
+  local -r module_name="$1"
+  local -r download_dir="$2"
+  local -r tag="$3"
+  local -r branch="$4"
+  local -r repo="$5"
+
+  if [[ ! -e "$download_dir/$module_name" ]]; then
+    log_error "No files were downloaded. Are you sure \"$module_name\" is a valid Script Module in $repo (tag = $tag, branch = $branch)?"
+    exit 1
+  fi
+}
+
+# http://stackoverflow.com/a/2264537/483528
+function to_lower_case {
+  tr '[:upper:]' '[:lower:]'
+}
+
+function get_os_name {
+  uname | to_lower_case
+}
+
+function get_os_arch {
+  uname -m
+}
+
+function string_contains {
+  local -r str="$1"
+  local -r contains="$2"
+
+  [[ "$str" == *"$contains"* ]]
+}
+
+function get_os_arch_gox_format {
+  local -r arch=$(get_os_arch)
+
+  if string_contains "$arch" "arm64"; then
+    echo "arm64"
+  elif string_contains "$arch" "aarch64"; then
+    echo "arm64"
+  elif string_contains "$arch" "64"; then
+    echo "amd64"
+  elif string_contains "$arch" "386"; then
+    echo "386"
+  elif string_contains "$arch" "arm"; then
+    echo "arm"
+  fi
+}
+
+# We release binaries with the name following the format <NAME>_<OS>_<ARCH> (e.g. foo_linux_amd64). Given the NAME of
+# a binary, this function adds the proper OS and ARCH to it for the current OS.
+function determine_binary_name {
+  local -r binary_name="$1"
+  local -r os_name=$(get_os_name)
+  local -r os_arch=$(get_os_arch_gox_format)
+  echo "${binary_name}_${os_name}_${os_arch}"
+}
+
+# Check if the repo is anonymously accessible. This indicates that the repo is public, and will skip checks for the
+# token.
+function repo_is_public {
+  local -r repo_url="$1"
+
+  curl --silent --fail "$repo_url" > /dev/null
+}
+
+function run_module {
+  local -r module_name="$1"
+  local -r download_dir="$2"
+  local -r tag="$3"
+  local -r branch="$4"
+  shift 4
+  local -ra module_params=("$@")
+  local -r install_script_path="${download_dir}/${module_name}/${MODULE_INSTALL_FILE_NAME}"
+
+  log_info "Setting nholuongut_INSTALL_TAG to $tag"
+  export nholuongut_INSTALL_TAG="$tag"
+
+  log_info "Setting nholuongut_INSTALL_BRANCH to $branch"
+  export nholuongut_INSTALL_BRANCH="$branch"
+
+  log_info "Executing $install_script_path ${module_params[*]}"
+  chmod u+x "$install_script_path"
+  "$install_script_path" "${module_params[@]}"
+}
+
+function install_script_module {
+  local tag=""
+  local branch=""
+  local ref=""
+  local module_name=""
+  local binary_name=""
+  local binary_sha256_checksum=""
+  local binary_sha512_checksum=""
+  local binary_install_dir="$DEFAULT_BIN_DIR"
+  local repo=""
+  local download_dir="$DEFAULT_MODULES_DOWNLOAD_DIR"
+  local module_params=()
+  local no_sudo="false"
+
+  while [[ $# -gt 0 ]]; do
+    local key="$1"
+
+    case "$key" in
+      --tag)
+        tag="$2"
+        shift
+        ;;
+      --branch)
+        branch="$2"
+        shift
+        ;;
+      --ref)
+        ref="$2"
+        shift
+        ;;
+      --module-name)
+        module_name="$2"
+        shift
+        ;;
+      --binary-name)
+        binary_name="$2"
+        shift
+        ;;
+      --binary-sha256-checksum)
+        binary_sha256_checksum="$2"
+        shift
+        ;;
+      --binary-sha512-checksum)
+        binary_sha512_checksum="$2"
+        shift
+        ;;
+      --repo)
+        repo="$2"
+        shift
+        ;;
+      --module-param)
+        if [[ $2 == *"="* ]]; then
+          local module_param_key="${2%%=*}"
+          local module_param_val="${2#*=}"
+          module_params+=( "--$module_param_key" "$module_param_val" )
+        else
+          module_params+=( "--$2" )
+        fi
+        shift
+        ;;
+      --download-dir)
+        download_dir="$2"
+        shift
+        ;;
+      --binary-install-dir)
+        binary_install_dir="$2"
+        shift
+        ;;
+      --no-sudo)
+        no_sudo="$2"
+        shift
+        ;;
+      --help)
+        print_usage
+        exit
+        ;;
+      *)
+        echo "ERROR: Unrecognized option: $key"
+        print_usage
+        exit 1
+        ;;
+    esac
+
+    shift
+  done
+
+  assert_not_empty "--repo" "$repo"
+  assert_is_installed fetch
+
+  if ! repo_is_public "$repo"; then
+    log_info "Repository is not public. GITHUB_OAUTH_TOKEN environment variable is required."
+    assert_env_var_not_empty "GITHUB_OAUTH_TOKEN"
+  fi
+
+  if [[ ( -z "$module_name" && -z "$binary_name" ) || ( -n "$module_name" && -n "$binary_name" ) ]]; then
+    log_error "You must specify exactly one of --module-name or --binary-name."
+    exit 1
+  fi
+
+  if [[ -n "$binary_name" && -z "$tag" ]]; then
+    log_error "--binary-name can only be used if you specify a release via --tag."
+    exit 1
+  fi
+
+  if [[ -n "$binary_sha256_checksum" && -n "$binary_sha512_checksum" ]]; then
+    log_error "You must specify at most one of --binary-sha256-checksum and --binary-sha512-checksum"
+    exit 1
+  fi
+
+  if [[ -n "$module_name" ]]; then
+    log_info "Installing from $module_name..."
+    fetch_script_module "$module_name" "$tag" "$branch" "$ref" "$download_dir" "$repo"
+    validate_module "$module_name" "$download_dir" "$tag" "$branch" "$repo"
+    run_module "$module_name" "$download_dir" "$tag" "$branch" "${module_params[@]}"
+  else
+    log_info "Installing $binary_name..."
+    fetch_binary "$binary_name" "$tag" "$download_dir" "$repo" "$binary_sha256_checksum" "$binary_sha512_checksum" "$binary_install_dir" "$no_sudo"
+  fi
+
+  log_info "Success!"
+}
+
+install_script_module "$@"

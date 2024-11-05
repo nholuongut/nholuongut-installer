@@ -1,0 +1,26 @@
+defaults: &defaults
+  working_directory: /home/circleci/.go_workspace/src/github.com/nholuongut/nholuongut-installer
+  machine:
+    enabled: true
+    image: ubuntu-2204:2022.04.1
+version: 2
+jobs:
+  test:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: run tests
+          command: |
+            ./_ci/run-tests.sh
+workflows:
+  version: 2
+  install-and-test:
+    jobs:
+      - test:
+          filters:
+            tags:
+              only: /^v.*/
+          context:
+            - AWS__PHXDEVOPS__circle-ci-test
+            - GITHUB__PAT__nholuongut-ci
